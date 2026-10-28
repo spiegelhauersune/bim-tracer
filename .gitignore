@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+# Manufacturers' drawings are copyrighted: never commit them, or renders of them.
+*.pdf
+*.png
+jobs/
