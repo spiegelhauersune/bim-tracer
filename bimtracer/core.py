@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 The bim-tracer authors. See LICENSE.
-"""sectrace: turn a manufacturer's vector section drawing (PDF) into BIM-engine profile
-extrusions and place them as a mitred frame over MCP.
+"""bim-tracer core: turn a manufacturer's vector section drawing (PDF) into profile polygons in mm.
 
-Subcommands (run with --help for options):
-  fetch     download an uploaded drawing set file (REST, same key as MCP)
+Steps (also available as a CLI, `python -m bimtracer.core <cmd> --help`):
   pages     list pages, size, rotation
   text      text lines with positions (display pt) - find the section and its dimensions
   scale     calibrate the drawing scale from printed dimensions vs. dimension lines
   overview  whole page as PNG with a 50 pt grid (to choose a clip)
   render    render one section (clip in pt) at a known scale into a job folder
   regions   number every white region of the render: table + labelled PNG
-  trace     regions -> profile polygons (mm), checked against the engine's rules
-  plan      traced profiles -> create/place/group calls for a rectangular mitred frame
-  apply     run a plan over MCP (dry run of every call first)
+  trace     regions -> profile polygons (mm), checked against the BIM engine's profile rules
 
-Coordinates: a job's "crop mm" frame is real millimetres, x to the right, y up, (0,0) at
-the bottom-left of the clip. The trace spec moves and flips that into the profile frame:
-x = depth (0 = the face that will sit at origin.y in the world), y = towards the opening
-centre (0 = the frame's outer edge).
+Coordinates: a job's "crop mm" frame is real millimetres, x to the right, y up, (0,0) at the
+bottom-left of the clip. The trace spec moves and flips that into the profile frame: x = depth
+(0 = the outer face), y = towards the opening centre (0 = the frame's outer edge).
 """
 import argparse
-import asyncio
 import json
 import math
-import os
 import re
 import sys
 from pathlib import Path
@@ -34,9 +27,12 @@ STD_SCALES = [1, 2, 2.5, 4, 5, 10, 20, 25, 50, 100, 200, 500]
 PT_PER_MM = 72 / 25.4
 
 
+class TracerError(Exception):
+    """A problem with the input (bad page, clip, spec, ...); the message says what to fix."""
+
+
 def die(msg):
-    print('ERROR: ' + msg, file=sys.stderr)
-    sys.exit(2)
+    raise TracerError(msg)
 
 
 def load_json(p):
@@ -121,9 +117,9 @@ def cmd_text(a):
 
 
 # --------------------------------------------------------------------------- scale
-def cmd_scale(a):
-    _, p = open_page(a.pdf, a.page)
-    clip = parse_clip(a.clip) if a.clip else [-1e9, -1e9, 1e9, 1e9]
+def scale_votes(p, clip=None):
+    """Pairs printed dimensions with dimension lines. Returns (votes, scale n of 1:n or None)."""
+    clip = clip or [-1e9, -1e9, 1e9, 1e9]
     segs = segments(p)
     hz = [(min(x0, x1), max(x0, x1), (y0 + y1) / 2) for x0, y0, x1, y1 in segs if abs(y1 - y0) < 0.3 and abs(x1 - x0) > 1]
     vt = [(min(y0, y1), max(y0, y1), (x0 + x1) / 2) for x0, y0, x1, y1 in segs if abs(x1 - x0) < 0.3 and abs(y1 - y0) > 1]
@@ -170,20 +166,28 @@ def cmd_scale(a):
         n = PT_PER_MM * val / L          # scale 1:n
         snap = min(STD_SCALES, key=lambda s: abs(s - n) / s)
         votes.append((ln['text'], round(L, 1), round(n, 3), snap if abs(snap - n) / snap < 0.03 else None, ln['bbox']))
-    if not votes:
-        die('no printed dimension could be paired with a dimension line; give --scale yourself (title block)')
-    print('text  line_pt  implied_1:n  snapped  text_bbox')
-    for v in votes:
-        print(f'{v[0]:>5} {v[1]:8.1f} {v[2]:10.3f}  {str(v[3]):>7}  {v[4]}')
     tally = {}
     for v in votes:
         if v[3]:
             tally[v[3]] = tally.get(v[3], 0) + 1
-    if tally:
-        s = max(tally, key=tally.get)
-        print(f'\nSCALE 1:{s:g}  ({tally[s]} of {len(votes)} dimensions agree)')
+    best = max(tally, key=tally.get) if tally else None
+    return [{'text': v[0], 'line_pt': v[1], 'implied': v[2], 'snapped': v[3], 'bbox': v[4]} for v in votes], \
+        ({'scale': best, 'agree': tally[best], 'of': len(votes)} if best else None)
+
+
+def cmd_scale(a):
+    _, p = open_page(a.pdf, a.page)
+    votes, best = scale_votes(p, parse_clip(a.clip) if a.clip else None)
+    if not votes:
+        die('no printed dimension could be paired with a dimension line; give --scale yourself (title block)')
+    print('text  line_pt  implied_1:n  snapped  text_bbox')
+    for v in votes:
+        print(f"{v['text']:>5} {v['line_pt']:8.1f} {v['implied']:10.3f}  {str(v['snapped']):>7}  {v['bbox']}")
+    if best:
+        print(f"\nSCALE 1:{best['scale']:g}  ({best['agree']} of {best['of']} dimensions agree)")
     else:
         print('\nno standard scale fits within 3%: check the votes, or the drawing is not to scale')
+    return {'votes': votes, 'best': best}
 
 
 # --------------------------------------------------------------------------- overview / render
@@ -274,7 +278,7 @@ def cmd_regions(a):
     pairs = np.concatenate(pairs) if pairs else np.zeros((0, 2), int)
     up, cnt = np.unique(pairs, axis=0, return_counts=True) if len(pairs) else (np.zeros((0, 2), int), [])
     nb = {}
-    for (p, q), c in zip(up.tolist(), list(cnt)):
+    for (p, q), c in zip(up.tolist(), list(cnt), strict=True):
         L = c / meta['pxmm']
         nb.setdefault(p, []).append((q, L))
         nb.setdefault(q, []).append((p, L))
@@ -622,306 +626,13 @@ def cmd_trace(a):
     cv2.addWeighted(lay, 0.35, base, 0.65, 0, base)
     cv2.imwrite(str(job / 'overlay.png'), base)
     print(f"\nwrote {job/'profiles.json'} and {job/'overlay.png'}")
-    if any(r['problems'] for r in results.values()):
-        sys.exit(1)
-
-
-# --------------------------------------------------------------------------- plan
-R2 = math.sqrt(0.5)
-SIDES = {  # local X, Y, Z images; frame plane = parent XZ, depth = +Y, local Y points inwards
-    'sill': (((0, 1, 0), (0, 0, 1), (1, 0, 0)), 'W', (0, 0)),
-    'head': (((0, 1, 0), (0, 0, -1), (-1, 0, 0)), 'W', (1, 1)),
-    'jamb-l': (((0, 1, 0), (1, 0, 0), (0, 0, -1)), 'H', (0, 1)),
-    'jamb-r': (((0, 1, 0), (-1, 0, 0), (0, 0, 1)), 'H', (1, 0)),
-}
-
-
-def quat(R):
-    m = [[R[c][r] for c in range(3)] for r in range(3)]
-    t = m[0][0] + m[1][1] + m[2][2]
-    if t > 0:
-        s = math.sqrt(t + 1) * 2
-        q = {'w': s / 4, 'x': (m[2][1] - m[1][2]) / s, 'y': (m[0][2] - m[2][0]) / s, 'z': (m[1][0] - m[0][1]) / s}
-    else:
-        i = max(range(3), key=lambda i: m[i][i])
-        j, k = (i + 1) % 3, (i + 2) % 3
-        s = math.sqrt(1 + m[i][i] - m[j][j] - m[k][k]) * 2
-        v = [0.0, 0.0, 0.0]
-        v[i] = s / 4
-        v[j] = (m[j][i] + m[i][j]) / s
-        v[k] = (m[k][i] + m[i][k]) / s
-        q = {'x': v[0], 'y': v[1], 'z': v[2], 'w': (m[k][j] - m[j][k]) / s}
-    return {k: round(v, 8) for k, v in q.items()}
-
-
-def yaw_matrix(deg):
-    """Rotation about Z by deg (columns = images of X, Y, Z)."""
-    c, s = round(math.cos(math.radians(deg)), 12), round(math.sin(math.radians(deg)), 12)
-    return ((c, s, 0), (-s, c, 0), (0, 0, 1))
-
-
-def apply_rot(R, v):
-    return [R[0][i] * v[0] + R[1][i] * v[1] + R[2][i] * v[2] for i in range(3)]
-
-
-def cmd_plan(a):
-    job = Path(a.job)
-    prof = load_json(job / 'profiles.json')['parts']
-    fr = load_json(a.spec)
-    W, H = fr['width'], fr['height']
-    o = fr['origin']
-    pref = fr['slugPrefix']
-    parent = fr.get('parent', 'B1')
-    # yawDeg turns the window about Z around origin: 0 = window plane XZ with depth +Y (exterior face at
-    # origin.y), 90 = plane YZ with depth -X, 180 = depth -Y, -90 = depth +X. Use it to set a window in a wall.
-    Y = yaw_matrix(fr.get('yawDeg', 0))
-    existing = fr.get('definitions') == 'existing'   # place onto catalogue definitions as they are
-
-    def world(local):
-        w = apply_rot(Y, local)
-        return {'x': round(o['x'] + w[0], 2), 'y': round(o['y'] + w[1], 2), 'z': round(o['z'] + w[2], 2)}
-
-    def turned(R):
-        return tuple(tuple(apply_rot(Y, col)) for col in R)
-    calls = {'materials': fr.get('materials', []), 'definitions': [], 'placements': [],
-             'group': None, 'summary': {}}
-    for name, p in prof.items():
-        if p['problems']:
-            die(f'part {name} has problems; fix the trace first')
-        dfn = p['definition']
-        if not dfn:
-            die(f'part {name} has no "definition" in the trace spec')
-        if p['role'] == 'pane' or existing:
-            continue
-        geo = {'kind': 'profile', 'outer': [{'x': x, 'y': y} for x, y in p['rings'][0]],
-               'length': {'min': fr.get('minLength', 200), 'max': fr.get('maxLength', 3000),
-                          'default': max(W, H)}}
-        if len(p['rings']) > 1:
-            geo['holes'] = [[{'x': x, 'y': y} for x, y in h] for h in p['rings'][1:]]
-        d = {'category': 'window_door', 'collisionClass': 'solid', 'bomUnit': 'lm'}
-        d.update(dfn)
-        d['geometry'] = geo
-        calls['definitions'].append(d)
-    for name, p in prof.items():
-        if p['role'] == 'pane':
-            continue
-        code = p['definition']['code']
-        w, dd = p['size']['w'], p['size']['d']
-        for ci, dx in enumerate(p['copies']):
-            bx, by = p['offset']['x'] + dx, p['offset']['y']
-            tag = name if len(p['copies']) == 1 else f'{name}{ci+1}'
-            for side, (R, which, (cx, cz)) in SIDES.items():
-                L = W if which == 'W' else H
-                corner = (cx * W, 0, cz * H)
-                pos = [corner[i] + R[0][i] * bx + R[1][i] * by for i in range(3)]
-                calls['placements'].append({
-                    'parent': parent, 'definitionCode': code, 'slug': f'{pref}-{tag}-{side}',
-                    'dims': {'w': w, 'd': dd, 'h': L},
-                    'position': world(pos),
-                    'rotation': {'quat': quat(turned(R))},
-                    'shape': {'kind': 'extrusion', 'cuts': [
-                        {'normal': {'x': 0, 'y': R2, 'z': -R2}, 'offset': round(-by * R2, 4)},
-                        {'normal': {'x': 0, 'y': R2, 'z': R2}, 'offset': round((L - by) * R2, 4)}]}})
-    panes = [(n, p) for n, p in prof.items() if p['role'] == 'pane']
-    for k, (name, p) in enumerate(panes):
-        t = p.get('thickness') or round(p['size']['w'], 1)   # prefer the printed thickness
-        if abs(t - p['size']['w']) > 0.5:
-            print(f"warning: pane {name}: thickness {t} differs from the traced {p['size']['w']:.1f} mm")
-        edge = p['offset']['y']
-        dfn = dict(p['definition'])
-        dfn.setdefault('category', 'window_door')
-        dfn.setdefault('collisionClass', 'solid')
-        dfn.setdefault('bomUnit', 'm2')
-        dfn['geometry'] = {'kind': 'sheet', 'thickness': t, 'maxW': max(3000, W), 'maxH': max(3000, H)}
-        if not existing and not any(d['code'] == dfn['code'] for d in calls['definitions']):
-            calls['definitions'].append(dfn)
-        for ci, dx in enumerate(p['copies']):
-            pane = {
-                'parent': parent, 'definitionCode': dfn['code'],
-                'slug': f"{pref}-{name}{'' if len(p['copies']) == 1 else ci+1}",
-                'dims': {'w': round(W - 2 * edge, 1), 'd': t, 'h': round(H - 2 * edge, 1)},
-                'position': world((edge, p['offset']['x'] + dx, edge))}
-            if fr.get('yawDeg', 0):
-                pane['rotation'] = {'quat': quat(Y)}
-            calls['placements'].append(pane)
-    if fr.get('group'):
-        calls['group'] = {'name': fr['group'], 'parent': parent,
-                          'members': [f"{parent}/{c['slug']}" for c in calls['placements']]}
-    depth = (min(p['offset']['x'] for p in prof.values()), max(p['offset']['x'] + p['size']['w'] for p in prof.values()))
-    corners = [world((u, v, z)) for u in (0, W) for v in depth for z in (0, H)]
-    calls['summary'] = {'materials': len(calls['materials']), 'definitions': len(calls['definitions']),
-                        'placements': len(calls['placements']), 'yawDeg': fr.get('yawDeg', 0),
-                        'bbox': {k: [min(c[k] for c in corners), max(c[k] for c in corners)] for k in 'xyz'}}
-    save_json(job / 'plan.json', calls)
-    print(json.dumps(calls['summary'], indent=1))
-    print(f"wrote {job/'plan.json'}")
-
-
-# --------------------------------------------------------------------------- apply (MCP)
-KEY_VARS = ('MCP_BIM_API_KEY', 'BIM_API_KEY')   # Hermes' config.yaml uses ${MCP_BIM_API_KEY}
-MIN_CALL_GAP_S = 0.1                             # <= 10 tool calls/s; the server limit is 20 requests/s per key
-
-
-def api_key():
-    for var in KEY_VARS:
-        if os.environ.get(var):
-            return os.environ[var]
-    found = {}
-    for env in ('/opt/data/.env', os.path.expanduser('~/.hermes/.env')):
-        try:
-            for line in Path(env).read_text().splitlines():
-                name, _, value = line.partition('=')
-                if name.strip() in KEY_VARS and value.strip():
-                    found.setdefault(name.strip(), value.strip().strip('"\''))
-        except OSError:
-            pass
-    for var in KEY_VARS:
-        if var in found:
-            return found[var]
-    die('no BIM key: set MCP_BIM_API_KEY (as in Hermes config.yaml) or BIM_API_KEY, in the env or /opt/data/.env')
-
-
-def mcp_transport(url):
-    """Streamable HTTP transport with the bearer key; works with mcp 1.x and 2.x."""
-    import contextlib
-    headers = {'Authorization': f'Bearer {api_key()}'}
-    try:
-        from mcp.client.streamable_http import streamable_http_client      # mcp >= 2
-        from mcp.shared._httpx_utils import create_mcp_http_client
-
-        @contextlib.asynccontextmanager
-        async def cm():
-            async with create_mcp_http_client(headers=headers) as http:
-                async with streamable_http_client(url, http_client=http) as streams:
-                    yield streams[0], streams[1]
-        return cm()
-    except ImportError:
-        from mcp.client.streamable_http import streamablehttp_client      # mcp 1.x
-
-        @contextlib.asynccontextmanager
-        async def cm():
-            async with streamablehttp_client(url, headers=headers) as streams:
-                yield streams[0], streams[1]
-        return cm()
-
-
-async def mcp_run(url, project, plan, dry_only, replace, log):
-    from mcp import ClientSession
-
-    async with mcp_transport(url) as (r, w):
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-
-            pace = {'last': 0.0}
-
-            async def call(name, args, ok_codes=()):
-                # The MCP endpoint allows 20 requests/s per key; a 429 tears down the whole session, so stay
-                # well below it (MIN_CALL_GAP_S) and retry a refused call a few times with backoff.
-                loop = asyncio.get_running_loop()
-                wait = pace['last'] + MIN_CALL_GAP_S - loop.time()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                pace['last'] = loop.time()
-                for attempt in range(4):
-                    try:
-                        res = await s.call_tool(name, args)
-                        break
-                    except Exception as e:     # rate limited (429) or a transient transport error
-                        if attempt == 3 or '429' not in repr(e) and 'Rate limit' not in repr(e):
-                            raise
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                text = ''.join(getattr(c, 'text', '') for c in res.content)
-                body = getattr(res, 'structured_content', None) or getattr(res, 'structuredContent', None)
-                if not body:
-                    try:   # dry runs prefix the JSON with a note such as "[dry run — nothing saved]"
-                        body = json.loads(text[text.index('{'):]) if '{' in text else {'raw': text}
-                    except ValueError:
-                        body = {'raw': text}
-                if getattr(res, 'is_error', None) or getattr(res, 'isError', None):
-                    code = body.get('code') if isinstance(body, dict) else None
-                    if code in ok_codes:
-                        return None
-                    raise RuntimeError(f"{name} failed: {text[:600]}\nargs: {json.dumps(args)[:600]}")
-                return body
-
-            await call('open_project', {'projectId': project})
-            log('project opened')
-            if replace:
-                for c in plan['placements']:
-                    await call('delete_or_erase', {'refs': [f"{c['parent']}/{c['slug']}"]}, ok_codes=('NOT_FOUND', 'VALIDATION'))
-                log(f"removed earlier parts with these slugs (if any)")
-            # 1. dry run everything that the server can check without the earlier steps saved
-            for m in plan['materials']:
-                await call('create_material', dict(m, dryRun=True))
-            same = set()
-            for d in plan['definitions']:
-                b = await call('create_component_definition', dict(d, dryRun=True))
-                if isinstance(b, dict) and b.get('unchanged'):
-                    same.add(d['code'])
-            log(f"dry run ok: {len(plan['materials'])} materials, {len(plan['definitions'])} definitions "
-                f"({len(same)} unchanged, {len(plan['definitions']) - len(same)} new or new revision)")
-            if dry_only:
-                # a placement can only be dry-run against a definition that is already stored as planned
-                planned = {d['code'] for d in plan['definitions']}
-                todo = [c for c in plan['placements'] if c['definitionCode'] in same or c['definitionCode'] not in planned]
-                for c in todo:
-                    await call('place_component', dict(c, dryRun=True))
-                log(f"dry run ok: {len(todo)} of {len(plan['placements'])} placements "
-                    f"(the rest use definitions that are not saved yet). Nothing was saved.")
-                return
-            for m in plan['materials']:
-                await call('create_material', m)
-            revs = {}
-            for d in plan['definitions']:
-                b = await call('create_component_definition', d)
-                revs[d['code']] = b.get('revision')
-            log('definitions saved: ' + ', '.join(f'{k} r{v}' for k, v in revs.items()))
-            for c in plan['placements']:
-                await call('place_component', dict(c, dryRun=True))
-            log(f"placement dry run ok ({len(plan['placements'])})")
-            placed = []
-            try:
-                for c in plan['placements']:
-                    await call('place_component', c)
-                    placed.append(c['slug'])
-            except RuntimeError:
-                log(f'stopped after {len(placed)} placements; undo with delete_or_erase on the slugs in plan.json')
-                raise
-            log(f'placed {len(placed)} parts')
-            if plan.get('group'):
-                g = await call('group_geometry', plan['group'])
-                log(f"group {g['group']['path']} with {g['memberCount']} members")
-            v = await call('validate_model', {'scope': plan['placements'][0]['parent'], 'warnings': 'summary'})
-            log(f"validate_model: ok={v.get('ok')} conflicts={len(v.get('conflicts', []))} warnings={len(v.get('warnings', []))}")
-            print(json.dumps({'revisions': revs, 'placed': len(placed), 'validate': v}, indent=1)[:3000])
-
-
-def cmd_fetch(a):
-    """Download the original file of an uploaded drawing set (ids from get_drawing_set)."""
-    import urllib.request
-    base = (a.url or os.environ.get('BIM_MCP_URL', 'http://host.docker.internal:8080/mcp')).rsplit('/mcp', 1)[0]
-    req = urllib.request.Request(f'{base}/api/v1/drawings/{a.set}/files/{a.file}/original',
-                                 headers={'Authorization': f'Bearer {api_key()}'})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        data = r.read()
-    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.out).write_bytes(data)
-    print(f'wrote {a.out} ({len(data)} bytes)')
-
-
-def cmd_apply(a):
-    plan = load_json(Path(a.job) / 'plan.json')
-    url = a.url or os.environ.get('BIM_MCP_URL', 'http://host.docker.internal:8080/mcp')
-    asyncio.run(mcp_run(url, a.project, plan, a.dry_run_only, a.replace, lambda m: print('- ' + m, flush=True)))
+    return results
 
 
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    p = sub.add_parser('fetch'); p.add_argument('--set', required=True, help='drawing set id')
-    p.add_argument('--file', required=True, help='file id from get_drawing_set'); p.add_argument('--out', required=True)
-    p.add_argument('--url'); p.set_defaults(f=cmd_fetch)
     p = sub.add_parser('pages'); p.add_argument('pdf'); p.set_defaults(f=cmd_pages)
     p = sub.add_parser('text'); p.add_argument('pdf'); p.add_argument('--page', type=int, default=1)
     p.add_argument('--grep'); p.add_argument('--clip', help='x0,y0,x1,y1 pt'); p.set_defaults(f=cmd_text)
@@ -940,13 +651,14 @@ def main():
     p.add_argument('--small', type=float, default=2.0, help='mm2; regions below this can form hatch clusters')
     p.add_argument('--hatch-min', type=int, default=6); p.set_defaults(f=cmd_regions)
     p = sub.add_parser('trace'); p.add_argument('job'); p.add_argument('--spec', required=True); p.set_defaults(f=cmd_trace)
-    p = sub.add_parser('plan'); p.add_argument('job'); p.add_argument('--spec', required=True); p.set_defaults(f=cmd_plan)
-    p = sub.add_parser('apply'); p.add_argument('job'); p.add_argument('--project', required=True)
-    p.add_argument('--url'); p.add_argument('--dry-run-only', action='store_true')
-    p.add_argument('--replace', action='store_true', help='delete parts with the planned slugs first')
-    p.set_defaults(f=cmd_apply)
     a = ap.parse_args()
-    a.f(a)
+    try:
+        r = a.f(a)
+    except TracerError as e:
+        print('ERROR: ' + str(e), file=sys.stderr)
+        sys.exit(2)
+    if a.cmd == 'trace' and r and any(p['problems'] for p in r.values()):
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,19 @@
+[project]
+name = "bim-tracer"
+version = "0.1.0"
+description = "Section drawings (vector PDF) to profile polygons in mm, as a library and an HTTP service"
+license = "AGPL-3.0-only"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "N", "B"]
+# N806: geometry code uses W, H, L, M for width, height, length and matrices on purpose
+ignore = ["E701", "E702", "E741", "B008", "N806"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

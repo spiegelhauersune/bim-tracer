@@ -1,0 +1,4 @@
+# Runtime dependencies (tested together). PyMuPDF is AGPL-3.0, hence this repository's licence.
+pymupdf==1.26.5
+numpy==2.5.4
+opencv-python-headless==5.0.0.93
